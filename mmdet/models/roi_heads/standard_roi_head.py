@@ -246,6 +246,11 @@ class StandardRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
 
         det_bboxes, det_labels = self.simple_test_bboxes(
             x, img_metas, proposal_list, self.test_cfg, rescale=rescale)
+
+        # skip post-processing when exporting to ONNX
+        if torch.onnx.is_in_onnx_export():
+            return [(det_bboxes[i], det_labels[i]) for i in range(len(det_bboxes))]
+
         bbox_results = [
             bbox2result(det_bboxes[i], det_labels[i],
                         self.bbox_head.num_classes)
