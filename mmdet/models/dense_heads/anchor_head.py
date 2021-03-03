@@ -561,12 +561,19 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
 
         result_list = []
         for img_id in range(len(img_metas)):
-            cls_score_list = [
-                cls_scores[i][img_id].detach() for i in range(num_levels)
-            ]
-            bbox_pred_list = [
-                bbox_preds[i][img_id].detach() for i in range(num_levels)
-            ]
+            # Keep batch dim while exporting to onnx
+            if torch.onnx.is_in_onnx_export():
+                cls_score_list = cls_scores
+                bbox_pred_list = bbox_preds
+            else:
+                cls_score_list = [
+                    cls_scores[i][img_id, None].detach()
+                    for i in range(num_levels)
+                ]
+                bbox_pred_list = [
+                    bbox_preds[i][img_id, None].detach()
+                    for i in range(num_levels)
+                ]
             img_shape = img_metas[img_id]['img_shape']
             scale_factor = img_metas[img_id]['scale_factor']
             if with_nms:
@@ -630,13 +637,16 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         for cls_score, bbox_pred, anchors in zip(cls_score_list,
                                                  bbox_pred_list, mlvl_anchors):
             assert cls_score.size()[-2:] == bbox_pred.size()[-2:]
-            cls_score = cls_score.permute(1, 2,
-                                          0).reshape(-1, self.cls_out_channels)
+            batch_size = cls_score.shape[0]
+            cls_score = cls_score.permute(0, 2, 3,
+                                          1).reshape(batch_size, -1,
+                                                     self.cls_out_channels)
             if self.use_sigmoid_cls:
                 scores = cls_score.sigmoid()
             else:
                 scores = cls_score.softmax(-1)
-            bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4)
+            bbox_pred = bbox_pred.permute(0, 2, 3,
+                                          1).reshape(batch_size, -1, 4)
             # Always keep topk op for dynamic input in onnx
             if nms_pre_t > 0 and (torch.onnx.is_in_onnx_export()
                                   or scores.shape[-2] > nms_pre_t):
@@ -647,37 +657,54 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                                       num_anchor)
                 # Get maximum scores for foreground classes.
                 if self.use_sigmoid_cls:
-                    max_scores, _ = scores.max(dim=1)
+                    max_scores, _ = scores.max(dim=-1)
                 else:
                     # remind that we set FG labels to [0, num_class-1]
                     # since mmdet v2.0
                     # BG cat_id: num_class
-                    max_scores, _ = scores[:, :-1].max(dim=1)
-                _, topk_inds = max_scores.topk(nms_pre)
-                anchors = anchors[topk_inds, :]
-                bbox_pred = bbox_pred[topk_inds, :]
-                scores = scores[topk_inds, :]
-            bboxes = self.bbox_coder.decode(
-                anchors, bbox_pred, max_shape=img_shape)
+                    max_scores, _ = scores[:, :-1].max(dim=-1)
+                _, topk_inds = max_scores.topk(nms_pre, dim=-1)
+                batch_inds = torch.arange(batch_size).view(
+                    -1, 1).expand_as(topk_inds)
+                anchors = anchors[topk_inds]
+                bbox_pred = bbox_pred[batch_inds, topk_inds]
+                scores = scores[batch_inds, topk_inds]
+            bboxes = self.bbox_coder.decode(anchors, bbox_pred, max_shape=None)
             mlvl_bboxes.append(bboxes)
             mlvl_scores.append(scores)
-        mlvl_bboxes = torch.cat(mlvl_bboxes)
+        mlvl_bboxes = torch.cat(mlvl_bboxes, dim=-2)
         if rescale:
             mlvl_bboxes /= mlvl_bboxes.new_tensor(scale_factor)
-        mlvl_scores = torch.cat(mlvl_scores)
-        # Set max number of box to be feed into nms in deployment
-        deploy_nms_pre = cfg.get('deploy_nms_pre', -1)
-        if deploy_nms_pre > 0 and torch.onnx.is_in_onnx_export():
-            max_scores, _ = mlvl_scores.max(dim=1)
-            _, topk_inds = max_scores.topk(deploy_nms_pre)
-            mlvl_scores = mlvl_scores[topk_inds, :]
-            mlvl_bboxes = mlvl_bboxes[topk_inds, :]
+        mlvl_scores = torch.cat(mlvl_scores, dim=1)
         if self.use_sigmoid_cls:
             # Add a dummy background class to the backend when using sigmoid
             # remind that we set FG labels to [0, num_class-1] since mmdet v2.0
             # BG cat_id: num_class
-            padding = mlvl_scores.new_zeros(mlvl_scores.shape[0], 1)
-            mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
+            padding = mlvl_scores.new_zeros(batch_size, mlvl_scores.shape[-2],
+                                            1)
+            mlvl_scores = torch.cat([mlvl_scores, padding], dim=-1)
+
+        # Set max number of box to be feed into nms in deployment
+        deploy_nms_pre = cfg.get('deploy_nms_pre', -1)
+        if deploy_nms_pre > 0 and torch.onnx.is_in_onnx_export():
+            max_scores, _ = mlvl_scores.max(dim=-1)
+            _, topk_inds = max_scores.topk(deploy_nms_pre)
+            batch_inds = torch.arange(batch_size).view(-1,
+                                                       1).expand_as(topk_inds)
+            mlvl_scores = mlvl_scores[batch_inds, topk_inds]
+            mlvl_bboxes = mlvl_bboxes[batch_inds, topk_inds]
+
+        # Replace multiclass_nms with ONNX::NonMaxSuppression in deployment
+        if torch.onnx.is_in_onnx_export():
+            from mmdet.core.export import add_dummy_nms_for_onnx
+            mlvl_scores = mlvl_scores.permute(0, 2, 1)
+            max_output_boxes_per_class = cfg.nms.get(
+                'max_output_boxes_per_class', 1000)
+            iou_threshold = cfg.nms.get('iou_threshold', 0.5)
+            score_threshold = cfg.score_thr
+            return add_dummy_nms_for_onnx(mlvl_bboxes, mlvl_scores,
+                                          max_output_boxes_per_class,
+                                          iou_threshold, score_threshold)
 
         if with_nms:
             det_bboxes, det_labels = multiclass_nms(mlvl_bboxes, mlvl_scores,

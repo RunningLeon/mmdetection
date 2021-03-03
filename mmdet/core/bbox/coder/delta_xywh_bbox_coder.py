@@ -69,7 +69,7 @@ class DeltaXYWHBBoxCoder(BaseBBoxCoder):
             torch.Tensor: Decoded boxes.
         """
 
-        assert pred_bboxes.size(0) == bboxes.size(0)
+        assert pred_bboxes.size(-2) == bboxes.size(-2)
         decoded_bboxes = delta2bbox(bboxes, pred_bboxes, self.means, self.stds,
                                     max_shape, wh_ratio_clip, self.clip_border)
 
@@ -171,22 +171,24 @@ def delta2bbox(rois,
                 [0.0000, 0.3161, 4.1945, 0.6839],
                 [5.0000, 5.0000, 5.0000, 5.0000]])
     """
-    means = deltas.new_tensor(means).view(1, -1).repeat(1, deltas.size(1) // 4)
-    stds = deltas.new_tensor(stds).view(1, -1).repeat(1, deltas.size(1) // 4)
+    means = deltas.new_tensor(means).view(1,
+                                          -1).repeat(1,
+                                                     deltas.size(-1) // 4)
+    stds = deltas.new_tensor(stds).view(1, -1).repeat(1, deltas.size(-1) // 4)
     denorm_deltas = deltas * stds + means
-    dx = denorm_deltas[:, 0::4]
-    dy = denorm_deltas[:, 1::4]
-    dw = denorm_deltas[:, 2::4]
-    dh = denorm_deltas[:, 3::4]
+    dx = denorm_deltas[..., 0::4]
+    dy = denorm_deltas[..., 1::4]
+    dw = denorm_deltas[..., 2::4]
+    dh = denorm_deltas[..., 3::4]
     max_ratio = np.abs(np.log(wh_ratio_clip))
     dw = dw.clamp(min=-max_ratio, max=max_ratio)
     dh = dh.clamp(min=-max_ratio, max=max_ratio)
     # Compute center of each roi
-    px = ((rois[:, 0] + rois[:, 2]) * 0.5).unsqueeze(1).expand_as(dx)
-    py = ((rois[:, 1] + rois[:, 3]) * 0.5).unsqueeze(1).expand_as(dy)
+    px = ((rois[..., 0] + rois[..., 2]) * 0.5).unsqueeze(2).expand_as(dx)
+    py = ((rois[..., 1] + rois[..., 3]) * 0.5).unsqueeze(2).expand_as(dy)
     # Compute width/height of each roi
-    pw = (rois[:, 2] - rois[:, 0]).unsqueeze(1).expand_as(dw)
-    ph = (rois[:, 3] - rois[:, 1]).unsqueeze(1).expand_as(dh)
+    pw = (rois[..., 2] - rois[..., 0]).unsqueeze(2).expand_as(dw)
+    ph = (rois[..., 3] - rois[..., 1]).unsqueeze(2).expand_as(dh)
     # Use exp(network energy) to enlarge/shrink each roi
     gw = pw * dw.exp()
     gh = ph * dh.exp()
